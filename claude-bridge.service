@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude Bridge - OpenAI-compatible proxy for Claude
+After=network.target
+
+[Service]
+Type=simple
+User=openclaw
+WorkingDirectory=/opt/claude-bridge
+ExecStart=/usr/bin/node /opt/claude-bridge/server.js
+Restart=always
+RestartSec=5
+Environment=HOME=/home/openclaw
+
+[Install]
+WantedBy=multi-user.target
