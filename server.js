@@ -1,30 +1,33 @@
 #!/usr/bin/env node
-// OpenAI-compatible API server — calls Anthropic API directly (no claude CLI subprocess)
+// OpenAI-compatible API server wrapping claude CLI
 // Listens on 0.0.0.0:3456 — restrict externally via firewall
 
 const http = require('http')
-const https = require('https')
+const { spawn } = require('child_process')
 const crypto = require('crypto')
-const fs = require('fs')
 
 const PORT = 3456
+const CLAUDE_BIN = '/bin/claude'
 const HOME = process.env.HOME || '/home/openclaw'
-const CREDS_FILE = `${HOME}/.claude/.credentials.json`
-const ANTHROPIC_API_HOST = 'api.anthropic.com'
-const ANTHROPIC_API_VERSION = '2023-06-01'
-const MAX_MESSAGES = 40
 
 const MODEL_MAP = {
     'claude-sonnet-4-6': 'claude-sonnet-4-6',
     'claude-opus-4-7': 'claude-opus-4-7',
-    'claude-haiku-4-5': 'claude-haiku-4-5-20251001'
+    'claude-haiku-4-5': 'claude-haiku-4-5'
 }
-const DEFAULT_MODEL = 'claude-sonnet-4-6'
+
+const fs = require('fs')
+const CREDS_FILE = `${HOME}/.claude/.credentials.json`
 
 function readCreds() {
     try {
         return JSON.parse(fs.readFileSync(CREDS_FILE, 'utf8'))
     } catch { return null }
+}
+
+function getOAuthExpiresAt() {
+    const c = readCreds()
+    return c?.claudeAiOauth?.expiresAt || c?.expiresAt || 0
 }
 
 function getApiKey() {
@@ -34,178 +37,140 @@ function getApiKey() {
     return null
 }
 
+function isApiKeyMode() {
+    return getApiKey() !== null
+}
+
 function updateCredentials(newCreds) {
     fs.mkdirSync(`${HOME}/.claude`, { recursive: true, mode: 0o700 })
     fs.writeFileSync(CREDS_FILE, JSON.stringify(newCreds, null, 2), { mode: 0o600 })
     try { fs.chownSync(CREDS_FILE, 999, 996) } catch {}
 }
 
-// Retry delays: 5s, 15s, 30s
+// Warn when OAuth token is within 90 minutes of expiry (skipped in API key mode)
+setInterval(() => {
+    if (isApiKeyMode()) return
+    const expiresAt = getOAuthExpiresAt()
+    const minsLeft = Math.floor((expiresAt - Date.now()) / 60000)
+    if (minsLeft < 90 && minsLeft > 0) {
+        console.warn(`[token-warn] Claude OAuth token expires in ${minsLeft}m — sync from Mac needed`)
+    }
+}, 15 * 60 * 1000)
+
+// Auth status cached and refreshed async so dashboard never blocks the event loop
+let cachedAuthStatus = 'unknown'
+function refreshAuthStatus() {
+    const { exec } = require('child_process')
+    exec(`${CLAUDE_BIN} --version`, { env: buildClaudeEnv(), timeout: 5000 }, (err) => {
+        cachedAuthStatus = err ? 'error' : 'ok'
+    })
+}
+refreshAuthStatus()
+setInterval(refreshAuthStatus, 5 * 60 * 1000)
+
+// Rate-limit / overload patterns from Anthropic's error responses
+const RATE_LIMIT_RE = /rate.?limit|too.many.requests|usage.limit|overloaded|529|please.try.again|temporarily.unavailable/i
+
+function isRateLimit(text) {
+    return RATE_LIMIT_RE.test(text)
+}
+
+function buildClaudeEnv() {
+    const env = { ...process.env, HOME }
+    const c = readCreds()
+    if (typeof c?.apiKey === 'string') {
+        env.ANTHROPIC_API_KEY = c.apiKey
+    }
+    return env
+}
+
+function extractText(messages) {
+    const parts = []
+    for (const msg of messages) {
+        if (msg.role === 'system') continue
+        const content = Array.isArray(msg.content)
+            ? msg.content.filter(c => c.type === 'text').map(c => c.text).join('\n')
+            : (msg.content || '')
+        if (content) parts.push(`[${msg.role}]: ${content}`)
+    }
+    return parts.join('\n\n')
+}
+
+function extractSystem(messages) {
+    return messages
+        .filter(m => m.role === 'system')
+        .map(m => Array.isArray(m.content) ? m.content.map(c => c.text).join('\n') : m.content)
+        .join('\n')
+}
+
+// Retry delays for rate-limit backoff: 5s, 15s, 30s
 const RETRY_DELAYS = [5000, 15000, 30000]
 
-// Convert OpenAI messages array → Anthropic messages array.
-// Merges consecutive same-role blocks (Anthropic rejects them).
-// Windows to MAX_MESSAGES entries. Strips system messages (handled separately).
-function toAnthropicMessages(openaiMessages) {
-    const filtered = openaiMessages
-        .filter(m => m.role !== 'system')
-        .map(m => {
-            const text = Array.isArray(m.content)
-                ? m.content.filter(c => c.type === 'text').map(c => c.text).join('\n')
-                : (m.content || '')
-            const role = m.role === 'assistant' ? 'assistant' : 'user'
-            return { role, content: text }
-        })
-        .filter(m => m.content.length > 0)
+function runClaude(prompt, systemPrompt, model, onDone, attempt = 0) {
+    const args = ["--print", prompt, "--output-format", "json", "--no-session-persistence", "--dangerously-skip-permissions"]
+    if (model && MODEL_MAP[model]) args.push('--model', MODEL_MAP[model])
+    if (systemPrompt) args.push('--system-prompt', systemPrompt)
 
-    // Merge consecutive same-role messages
-    const merged = []
-    for (const msg of filtered) {
-        if (merged.length > 0 && merged[merged.length - 1].role === msg.role) {
-            merged[merged.length - 1].content += '\n\n' + msg.content
+    const proc = spawn(CLAUDE_BIN, args, {
+        env: buildClaudeEnv(),
+        timeout: 600000
+    })
+
+    let out = ''
+    let err = ''
+    proc.stdout.on('data', d => { out += d })
+    proc.stderr.on('data', d => { err += d })
+
+    // Without this handler an unexpected spawn failure (ENOMEM, ENOENT, etc.)
+    // would emit an unhandled 'error' event and crash the server.
+    proc.on('error', spawnErr => {
+        const msg = spawnErr.message || String(spawnErr)
+        console.error(`[bridge] spawn error (attempt ${attempt + 1}): ${msg}`)
+        if (attempt < RETRY_DELAYS.length && isRateLimit(msg)) {
+            const delay = RETRY_DELAYS[attempt]
+            console.warn(`[bridge] rate limit on spawn, retry in ${delay / 1000}s`)
+            setTimeout(() => runClaude(prompt, systemPrompt, model, onDone, attempt + 1), delay)
         } else {
-            merged.push({ role: msg.role, content: msg.content })
+            onDone(null, `spawn error: ${msg}`, null)
         }
-    }
+    })
 
-    // Anthropic requires the first message to be from user
-    while (merged.length > 0 && merged[0].role !== 'user') merged.shift()
-
-    // Window to last MAX_MESSAGES, keeping user-first invariant
-    let windowed = merged.slice(-MAX_MESSAGES)
-    while (windowed.length > 0 && windowed[0].role !== 'user') windowed.shift()
-
-    return windowed
-}
-
-function extractSystem(openaiMessages) {
-    return openaiMessages
-        .filter(m => m.role === 'system')
-        .map(m => Array.isArray(m.content) ? m.content.map(c => c.text).join('\n') : (m.content || ''))
-        .join('\n')
-        .trim()
-}
-
-function callAnthropic(anthropicMessages, systemPrompt, model, onDone, attempt = 0) {
-    const apiKey = getApiKey()
-    if (!apiKey) {
-        onDone(null, 'No API key configured — POST to /token-push or add apiKey to credentials', null)
-        return
-    }
-
-    const resolvedModel = MODEL_MAP[model] || DEFAULT_MODEL
-
-    const body = {
-        model: resolvedModel,
-        max_tokens: 8192,
-        messages: anthropicMessages
-    }
-
-    if (systemPrompt) {
-        body.system = [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }]
-    }
-
-    // Cache the last user turn for repeated-prompt workloads
-    if (body.messages.length > 0) {
-        const last = body.messages[body.messages.length - 1]
-        if (last.role === 'user' && typeof last.content === 'string') {
-            body.messages[body.messages.length - 1] = {
-                role: 'user',
-                content: [{ type: 'text', text: last.content, cache_control: { type: 'ephemeral' } }]
-            }
-        }
-    }
-
-    const payload = JSON.stringify(body)
-
-    const options = {
-        hostname: ANTHROPIC_API_HOST,
-        path: '/v1/messages',
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(payload),
-            'x-api-key': apiKey,
-            'anthropic-version': ANTHROPIC_API_VERSION,
-            'anthropic-beta': 'prompt-caching-2024-07-31'
-        }
-    }
-
-    const req = https.request(options, (res) => {
-        let raw = ''
-        res.on('data', d => { raw += d })
-        res.on('end', () => {
-            const status = res.statusCode
-
-            if (status === 429 || status === 529) {
-                totalRateLimits++
-                let retryAfter = parseInt(res.headers['retry-after'] || '0', 10) * 1000
-                const delay = retryAfter > 0 ? retryAfter : (RETRY_DELAYS[attempt] || RETRY_DELAYS[RETRY_DELAYS.length - 1])
-
-                let errDetail = raw.slice(0, 200)
-                try {
-                    const e = JSON.parse(raw)
-                    errDetail = `${e.error?.type || ''}: ${e.error?.message || raw}`.slice(0, 200)
-                } catch {}
-
-                if (attempt < RETRY_DELAYS.length) {
-                    console.warn(`[bridge] HTTP ${status} rate limit (attempt ${attempt + 1}), retry in ${delay / 1000}s — ${errDetail}`)
-                    setTimeout(() => callAnthropic(anthropicMessages, systemPrompt, model, onDone, attempt + 1), delay)
+    proc.on('close', code => {
+        try {
+            const result = JSON.parse(out)
+            if (result.is_error) {
+                const errMsg = result.result || 'Error from claude'
+                if (attempt < RETRY_DELAYS.length && isRateLimit(errMsg)) {
+                    const delay = RETRY_DELAYS[attempt]
+                    console.warn(`[bridge] rate limit (is_error), retry in ${delay / 1000}s (attempt ${attempt + 1}): ${errMsg.slice(0, 120)}`)
+                    totalRateLimits++
+                    setTimeout(() => runClaude(prompt, systemPrompt, model, onDone, attempt + 1), delay)
                 } else {
-                    console.error(`[bridge] HTTP ${status} rate limit — exhausted retries — ${errDetail}`)
-                    onDone(null, `HTTP ${status} rate limit after ${attempt} retries: ${errDetail}`, null)
+                    console.error(`[bridge] claude is_error (attempt ${attempt + 1}): ${errMsg.slice(0, 200)}`)
+                    onDone(null, errMsg, null)
                 }
-                return
-            }
-
-            if (status !== 200) {
-                let errDetail = raw.slice(0, 300)
-                try {
-                    const e = JSON.parse(raw)
-                    errDetail = `${e.error?.type || 'unknown'}: ${e.error?.message || raw}`
-                } catch {}
-                console.error(`[bridge] HTTP ${status} from Anthropic API — ${errDetail}`)
-                onDone(null, `HTTP ${status} from Anthropic API — ${errDetail}`, null)
-                return
-            }
-
-            try {
-                const result = JSON.parse(raw)
-                const text = (result.content || [])
-                    .filter(c => c.type === 'text')
-                    .map(c => c.text)
-                    .join('')
+            } else {
                 const u = result.usage || {}
                 const usage = {
                     prompt_tokens: (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0),
                     completion_tokens: u.output_tokens || 0,
                     total_tokens: (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.output_tokens || 0)
                 }
-                onDone(text, null, usage)
-            } catch (parseErr) {
-                console.error(`[bridge] Failed to parse Anthropic 200 response: ${parseErr.message} — raw: ${raw.slice(0, 200)}`)
-                onDone(null, `Response parse error: ${parseErr.message}`, null)
+                onDone(result.result || '', null, usage)
             }
-        })
-    })
-
-    req.on('error', (err) => {
-        console.error(`[bridge] HTTPS request error (attempt ${attempt + 1}): ${err.message}`)
-        if (attempt < RETRY_DELAYS.length) {
-            const delay = RETRY_DELAYS[attempt]
-            console.warn(`[bridge] Retrying in ${delay / 1000}s`)
-            setTimeout(() => callAnthropic(anthropicMessages, systemPrompt, model, onDone, attempt + 1), delay)
-        } else {
-            onDone(null, `HTTPS error after ${attempt} retries: ${err.message}`, null)
+        } catch {
+            const errMsg = err || out || 'Unknown error'
+            if (attempt < RETRY_DELAYS.length && isRateLimit(errMsg)) {
+                const delay = RETRY_DELAYS[attempt]
+                console.warn(`[bridge] rate limit (no JSON), retry in ${delay / 1000}s (attempt ${attempt + 1}): ${errMsg.slice(0, 120)}`)
+                totalRateLimits++
+                setTimeout(() => runClaude(prompt, systemPrompt, model, onDone, attempt + 1), delay)
+            } else {
+                console.error(`[bridge] claude no-JSON exit (attempt ${attempt + 1}, code ${code}): ${errMsg.slice(0, 200)}`)
+                onDone(null, errMsg, null)
+            }
         }
     })
-
-    req.setTimeout(120000, () => {
-        req.destroy(new Error('request timeout'))
-    })
-
-    req.write(payload)
-    req.end()
 }
 
 let requestLog = []
@@ -213,18 +178,11 @@ let totalRequests = 0
 let totalErrors = 0
 let totalRateLimits = 0
 
-// Auth status: just check if we have a usable API key
-let cachedAuthStatus = 'unknown'
-function refreshAuthStatus() {
-    cachedAuthStatus = getApiKey() ? 'ok' : 'error'
-}
-refreshAuthStatus()
-setInterval(refreshAuthStatus, 5 * 60 * 1000)
-
 const server = http.createServer((req, res) => {
     if (req.method === 'GET' && (req.url === '/' || req.url === '/dashboard')) {
         const uptime = process.uptime()
-        const uptimeStr = `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`
+        const uptimeStr = `${Math.floor(uptime/3600)}h ${Math.floor((uptime%3600)/60)}m`
+        const apiKeyMode = isApiKeyMode()
         const html = `<!DOCTYPE html><html><head><title>Claude Bridge</title><meta charset="utf-8"><style>
 body{font-family:monospace;background:#0d1117;color:#e6edf3;margin:0;padding:24px}
 h1{color:#f0883e;font-size:18px;margin:0 0 4px}
@@ -236,11 +194,11 @@ h1{color:#f0883e;font-size:18px;margin:0 0 4px}
 .log{font-size:11px;color:#8b949e;max-height:200px;overflow-y:auto}
 .log div{padding:2px 0;border-bottom:1px solid #21262d}
 </style></head><body>
-<h1>Claude Bridge</h1><div class="sub">OpenAI-compatible proxy → Anthropic API (direct)</div>
+<h1>Claude Bridge</h1><div class="sub">OpenAI-compatible proxy → Claude CLI</div>
 <div class="grid">
 <div class="card"><div class="label">Status</div><div class="value ok">● Running</div></div>
-<div class="card"><div class="label">Auth</div><div class="value ${cachedAuthStatus === 'ok' ? 'ok' : 'err'}">${cachedAuthStatus === 'ok' ? '● API Key OK' : '✗ No API key'}</div></div>
-<div class="card"><div class="label">Mode</div><div class="value ok">Direct HTTPS API</div></div>
+<div class="card"><div class="label">Auth</div><div class="value ${cachedAuthStatus === 'ok' ? 'ok' : 'err'}">${cachedAuthStatus === 'ok' ? '● Authenticated' : '✗ Not authenticated'}</div></div>
+<div class="card"><div class="label">Mode</div><div class="value">${apiKeyMode ? '🔑 API Key' : '🔐 OAuth'}</div></div>
 <div class="card"><div class="label">Uptime</div><div class="value">${uptimeStr}</div></div>
 <div class="card"><div class="label">Total Requests</div><div class="value">${totalRequests}</div></div>
 <div class="card"><div class="label">Errors</div><div class="value ${totalErrors > 0 ? 'err' : ''}">${totalErrors}</div></div>
@@ -260,10 +218,12 @@ h1{color:#f0883e;font-size:18px;margin:0 0 4px}
         if (apiKey) {
             res.writeHead(200, { 'Content-Type': 'application/json' })
             res.end(JSON.stringify({ ok: true, type: 'apikey', permanent: true, expired: false }))
-        } else {
-            res.writeHead(200, { 'Content-Type': 'application/json' })
-            res.end(JSON.stringify({ ok: false, type: 'none', message: 'No API key configured' }))
+            return
         }
+        const expiresAt = getOAuthExpiresAt()
+        const minsLeft = Math.floor((expiresAt - Date.now()) / 60000)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, type: 'oauth', expiresAt, minsLeft, expired: minsLeft < 0 }))
         return
     }
 
@@ -276,7 +236,6 @@ h1{color:#f0883e;font-size:18px;margin:0 0 4px}
                 if (typeof newCreds.apiKey === 'string' && newCreds.apiKey.startsWith('sk-ant-')) {
                     const expiresAt = newCreds.expiresAt || Date.now() + 365 * 24 * 60 * 60 * 1000
                     updateCredentials({ apiKey: newCreds.apiKey, expiresAt })
-                    refreshAuthStatus()
                     console.log('[token-push] api key stored')
                     res.writeHead(200, { 'Content-Type': 'application/json' })
                     res.end(JSON.stringify({ ok: true, type: 'apikey' }))
@@ -317,13 +276,12 @@ h1{color:#f0883e;font-size:18px;margin:0 0 4px}
         }
 
         const { messages = [], model, stream } = parsed
-        const anthropicMessages = toAnthropicMessages(messages)
+        const prompt = extractText(messages)
         const systemPrompt = extractSystem(messages)
         totalRequests++
         const reqTime = new Date().toISOString().slice(11, 19)
-        const promptSnippet = (anthropicMessages.find(m => m.role === 'user')?.content || '').slice(0, 40)
 
-        if (anthropicMessages.length === 0) {
+        if (!prompt) {
             res.writeHead(400)
             res.end('No user message')
             return
@@ -336,14 +294,13 @@ h1{color:#f0883e;font-size:18px;margin:0 0 4px}
                 'Connection': 'keep-alive'
             })
 
-            callAnthropic(anthropicMessages, systemPrompt, model, (text, err, usage) => {
+            runClaude(prompt, systemPrompt, model, (text, err, usage) => {
                 if (err) totalErrors++
-                requestLog.push(`${reqTime} ${model || DEFAULT_MODEL} ${err ? '✗' : '✓'} ${promptSnippet}`)
+                requestLog.push(`${reqTime} ${model || 'default'} ${err ? '✗' : '✓'} ${prompt.slice(0, 40)}`)
                 if (requestLog.length > 100) requestLog.shift()
-
                 const id = 'chatcmpl-' + crypto.randomBytes(8).toString('hex')
                 const now = Math.floor(Date.now() / 1000)
-                const responseModel = MODEL_MAP[model] || DEFAULT_MODEL
+                const responseModel = MODEL_MAP[model] || 'claude-sonnet-4-6'
 
                 if (err) {
                     const chunk = { id, object: 'chat.completion.chunk', created: now, model: responseModel, choices: [{ index: 0, delta: { content: err }, finish_reason: null }] }
@@ -362,14 +319,13 @@ h1{color:#f0883e;font-size:18px;margin:0 0 4px}
                 res.end()
             })
         } else {
-            callAnthropic(anthropicMessages, systemPrompt, model, (text, err, usage) => {
+            runClaude(prompt, systemPrompt, model, (text, err, usage) => {
                 if (err) totalErrors++
-                requestLog.push(`${reqTime} ${model || DEFAULT_MODEL} ${err ? '✗' : '✓'} ${promptSnippet}`)
+                requestLog.push(`${reqTime} ${model || 'default'} ${err ? '✗' : '✓'} ${prompt.slice(0, 40)}`)
                 if (requestLog.length > 100) requestLog.shift()
-
                 const id = 'chatcmpl-' + crypto.randomBytes(8).toString('hex')
                 const now = Math.floor(Date.now() / 1000)
-                const responseModel = MODEL_MAP[model] || DEFAULT_MODEL
+                const responseModel = MODEL_MAP[model] || 'claude-sonnet-4-6'
                 const content = err ? `Error: ${err}` : (text || '')
 
                 res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -384,5 +340,5 @@ h1{color:#f0883e;font-size:18px;margin:0 0 4px}
 })
 
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`openclaw-claude-bridge v2 (direct API) listening on 0.0.0.0:${PORT}`)
+    console.log(`openclaw-claude-bridge listening on 0.0.0.0:${PORT}`)
 })
