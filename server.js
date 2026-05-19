@@ -160,6 +160,7 @@ function extractSystem(messages) {
 // Retry delays for rate-limit backoff: 5s, 15s, 30s
 const RETRY_DELAYS = [5000, 15000, 30000]
 
+// Non-streaming: collect all output then callback(text, err, usage)
 function runClaude(prompt, systemPrompt, modelFamily, tenantSlug, agentSlug, onDone, attempt = 0) {
     const claudeModel = FAMILY_MAP[modelFamily]
     const args = ["--print", prompt, "--output-format", "json", "--no-session-persistence", "--dangerously-skip-permissions"]
@@ -229,6 +230,110 @@ function runClaude(prompt, systemPrompt, modelFamily, tenantSlug, agentSlug, onD
             } else {
                 console.error(`[bridge] claude no-JSON exit (attempt ${attempt + 1}, code ${code}): ${errMsg.slice(0, 200)}`)
                 onDone(null, errMsg, null)
+            }
+        }
+    })
+}
+
+// Streaming: uses stream-json --verbose, calls onChunk(text) for each text event,
+// then onDone(err, usage) when finished. Metadata lines (tool use, system, etc.) are
+// consumed internally and never reach the caller.
+function runClaudeStream(prompt, systemPrompt, modelFamily, tenantSlug, agentSlug, onChunk, onDone, attempt = 0) {
+    const claudeModel = FAMILY_MAP[modelFamily]
+    const args = ["--print", prompt, "--output-format", "stream-json", "--verbose",
+                  "--no-session-persistence", "--dangerously-skip-permissions"]
+    if (claudeModel) args.push('--model', claudeModel)
+    if (systemPrompt) args.push('--system-prompt', systemPrompt)
+
+    const workspacePath = `${WORKSPACES_BASE}/${tenantSlug}/workspace-${agentSlug}`
+    if (!fs.existsSync(workspacePath)) {
+        return void onDone(`workspace not found: ${tenantSlug}/${agentSlug}`, null)
+    }
+
+    const proc = spawn(CLAUDE_BIN, args, {
+        env: buildClaudeEnv(),
+        cwd: workspacePath,
+        timeout: 600000
+    })
+
+    let lineBuf = ''
+    let resultEvent = null
+    let hasError = false
+    let errorMsg = ''
+    let stderrBuf = ''
+
+    proc.stdout.on('data', chunk => {
+        lineBuf += chunk.toString()
+        let nl
+        while ((nl = lineBuf.indexOf('\n')) !== -1) {
+            const line = lineBuf.slice(0, nl).trim()
+            lineBuf = lineBuf.slice(nl + 1)
+            if (!line) continue
+            let event
+            try { event = JSON.parse(line) } catch { continue }
+
+            if (event.type === 'assistant') {
+                // Forward text content blocks immediately as they arrive
+                const content = event.message?.content || []
+                for (const block of content) {
+                    if (block.type === 'text' && block.text) {
+                        onChunk(block.text)
+                    }
+                }
+            } else if (event.type === 'result') {
+                resultEvent = event
+                if (event.is_error) {
+                    hasError = true
+                    errorMsg = event.result || 'Error from claude'
+                }
+            }
+            // system/init, tool_use, tool_result — discard, never forwarded
+        }
+    })
+
+    proc.stderr.on('data', d => { stderrBuf += d })
+
+    proc.on('error', spawnErr => {
+        const msg = spawnErr.message || String(spawnErr)
+        console.error(`[bridge] stream spawn error (attempt ${attempt + 1}): ${msg}`)
+        if (attempt < RETRY_DELAYS.length && isRateLimit(msg)) {
+            const delay = RETRY_DELAYS[attempt]
+            console.warn(`[bridge] rate limit on stream spawn, retry in ${delay / 1000}s`)
+            setTimeout(() => runClaudeStream(prompt, systemPrompt, modelFamily, tenantSlug, agentSlug, onChunk, onDone, attempt + 1), delay)
+        } else {
+            onDone(`spawn error: ${msg}`, null)
+        }
+    })
+
+    proc.on('close', code => {
+        if (hasError) {
+            if (attempt < RETRY_DELAYS.length && isRateLimit(errorMsg)) {
+                totalRateLimits++
+                const delay = RETRY_DELAYS[attempt]
+                console.warn(`[bridge] rate limit (stream is_error), retry in ${delay / 1000}s (attempt ${attempt + 1})`)
+                setTimeout(() => runClaudeStream(prompt, systemPrompt, modelFamily, tenantSlug, agentSlug, onChunk, onDone, attempt + 1), delay)
+            } else {
+                console.error(`[bridge] claude stream is_error (attempt ${attempt + 1}): ${errorMsg.slice(0, 200)}`)
+                onDone(errorMsg, null)
+            }
+        } else if (resultEvent) {
+            const u = resultEvent.usage || {}
+            const usage = {
+                prompt_tokens: (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0),
+                completion_tokens: u.output_tokens || 0,
+                total_tokens: (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.output_tokens || 0)
+            }
+            onDone(null, usage)
+        } else {
+            const errMsg = stderrBuf || lineBuf || 'No result event received'
+            if (attempt < RETRY_DELAYS.length && isRateLimit(errMsg)) {
+                totalRateLimits++
+                const delay = RETRY_DELAYS[attempt]
+                console.warn(`[bridge] rate limit (stream no-result), retry in ${delay / 1000}s`)
+                setTimeout(() => runClaudeStream(prompt, systemPrompt, modelFamily, tenantSlug, agentSlug, onChunk, onDone, attempt + 1), delay)
+            } else {
+                console.error(`[bridge] stream no-result exit (attempt ${attempt + 1}, code ${code}): ${errMsg.slice(0, 200)}`)
+                onDone(errMsg, null)
             }
         }
     })
@@ -404,30 +509,50 @@ ${tenantRows}
                 'Connection': 'keep-alive'
             })
 
-            runClaude(prompt, systemPrompt, modelParsed.family, tenantSlug, agentSlug, (text, err, usage) => {
-                if (err) totalErrors++
-                requestLog.push(`${reqTime} [${tenantSlug}/${agentSlug}] ${modelParsed.family} ${err ? '✗' : '✓'} ${prompt.slice(0, 40)}`)
-                if (requestLog.length > 100) requestLog.shift()
-                const id = 'chatcmpl-' + crypto.randomBytes(8).toString('hex')
-                const now = Math.floor(Date.now() / 1000)
-                const responseModel = FAMILY_MAP[modelParsed.family] || 'claude-sonnet-4-6'
+            const id = 'chatcmpl-' + crypto.randomBytes(8).toString('hex')
+            const now = Math.floor(Date.now() / 1000)
+            const responseModel = FAMILY_MAP[modelParsed.family] || 'claude-sonnet-4-6'
 
-                if (err) {
-                    const chunk = { id, object: 'chat.completion.chunk', created: now, model: responseModel, choices: [{ index: 0, delta: { content: err }, finish_reason: null }] }
-                    res.write(`data: ${JSON.stringify(chunk)}\n\n`)
-                } else {
-                    const chunkSize = 20
-                    for (let i = 0; i < text.length; i += chunkSize) {
-                        const chunk = { id, object: 'chat.completion.chunk', created: now, model: responseModel, choices: [{ index: 0, delta: { content: text.slice(i, i + chunkSize) }, finish_reason: null }] }
-                        res.write(`data: ${JSON.stringify(chunk)}\n\n`)
+            // Send SSE keepalive comments every 15s so HTTP-layer idle timers don't
+            // fire while Claude is calling tools (no text output during that phase).
+            // SSE comments are filtered by the SSE parser — they never reach the
+            // application layer on the other end, but they do keep the TCP connection
+            // alive and reset Undici's bodyTimeout.
+            const keepalive = setInterval(() => { res.write(': ping\n\n') }, 15000)
+
+            runClaudeStream(
+                prompt, systemPrompt, modelParsed.family, tenantSlug, agentSlug,
+                (text) => {
+                    // Text delta arrives — forward immediately as SSE chunk
+                    const chunk = {
+                        id, object: 'chat.completion.chunk', created: now, model: responseModel,
+                        choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
                     }
-                }
+                    res.write(`data: ${JSON.stringify(chunk)}\n\n`)
+                },
+                (err, usage) => {
+                    clearInterval(keepalive)
+                    if (err) totalErrors++
+                    requestLog.push(`${reqTime} [${tenantSlug}/${agentSlug}] ${modelParsed.family} ${err ? '✗' : '✓'} ${prompt.slice(0, 40)}`)
+                    if (requestLog.length > 100) requestLog.shift()
 
-                const doneChunk = { id, object: 'chat.completion.chunk', created: now, model: responseModel, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }
-                res.write(`data: ${JSON.stringify(doneChunk)}\n\n`)
-                res.write('data: [DONE]\n\n')
-                res.end()
-            })
+                    if (err) {
+                        const errChunk = {
+                            id, object: 'chat.completion.chunk', created: now, model: responseModel,
+                            choices: [{ index: 0, delta: { content: `Error: ${err}` }, finish_reason: null }]
+                        }
+                        res.write(`data: ${JSON.stringify(errChunk)}\n\n`)
+                    }
+
+                    const doneChunk = {
+                        id, object: 'chat.completion.chunk', created: now, model: responseModel,
+                        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+                    }
+                    res.write(`data: ${JSON.stringify(doneChunk)}\n\n`)
+                    res.write('data: [DONE]\n\n')
+                    res.end()
+                }
+            )
         } else {
             runClaude(prompt, systemPrompt, modelParsed.family, tenantSlug, agentSlug, (text, err, usage) => {
                 if (err) totalErrors++
