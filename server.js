@@ -537,10 +537,16 @@ ${tenantRows}
             // SSE comments are filtered by the SSE parser — they never reach the
             // application layer on the other end, but they do keep the TCP connection
             // alive and reset Undici's bodyTimeout.
-            const keepalive = setInterval(() => { res.write(': ping\n\n') }, 15000)
+            const keepalive = setInterval(() => {
+                if (!res.writableEnded) {
+                    const hb = { id, object: 'chat.completion.chunk', created: now, model: responseModel,
+                                 choices: [{ index: 0, delta: {}, finish_reason: null }] }
+                    res.write('data: ' + JSON.stringify(hb) + '\n\n')
+                }
+            }, 15000)
 
             let killProc = null
-            res.on('close', () => { clearInterval(keepalive); if (killProc) killProc() })
+            res.on('close', () => { clearInterval(keepalive) })
 
             runClaudeStream(
                 prompt, systemPrompt, modelParsed.family, tenantSlug, agentSlug,
