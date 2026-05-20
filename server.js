@@ -142,6 +142,10 @@ function buildClaudeEnv(workspacePath = HOME) {
         if (!fs.existsSync(settingsDest)) {
             fs.copyFileSync(SETTINGS_FILE, settingsDest)
         }
+        const claudeJsonLink = `${workspacePath}/.claude.json`
+        if (!fs.existsSync(claudeJsonLink)) {
+            fs.symlinkSync(`${HOME}/.claude.json`, claudeJsonLink)
+        }
     } catch (e) {
         console.warn(`[env] claude dir setup failed for ${workspacePath}: ${e.message}`)
     }
