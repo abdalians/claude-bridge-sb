@@ -175,7 +175,8 @@ function runClaude(prompt, systemPrompt, modelFamily, tenantSlug, agentSlug, onD
     const proc = spawn(CLAUDE_BIN, args, {
         env: buildClaudeEnv(),
         cwd: workspacePath,
-        timeout: 600000
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 900000
     })
 
     let out = ''
@@ -238,7 +239,7 @@ function runClaude(prompt, systemPrompt, modelFamily, tenantSlug, agentSlug, onD
 // Streaming: uses stream-json --verbose, calls onChunk(text) for each text event,
 // then onDone(err, usage) when finished. Metadata lines (tool use, system, etc.) are
 // consumed internally and never reach the caller.
-function runClaudeStream(prompt, systemPrompt, modelFamily, tenantSlug, agentSlug, onChunk, onDone, attempt = 0) {
+function runClaudeStream(prompt, systemPrompt, modelFamily, tenantSlug, agentSlug, onChunk, onDone, attempt = 0, onAbort = null) {
     const claudeModel = FAMILY_MAP[modelFamily]
     const args = ["--print", prompt, "--output-format", "stream-json", "--verbose",
                   "--no-session-persistence", "--dangerously-skip-permissions"]
@@ -253,8 +254,11 @@ function runClaudeStream(prompt, systemPrompt, modelFamily, tenantSlug, agentSlu
     const proc = spawn(CLAUDE_BIN, args, {
         env: buildClaudeEnv(),
         cwd: workspacePath,
-        timeout: 600000
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 900000
     })
+
+    if (onAbort) onAbort(() => { try { proc.kill() } catch (_) {} })
 
     let lineBuf = ''
     let resultEvent = null
@@ -520,6 +524,9 @@ ${tenantRows}
             // alive and reset Undici's bodyTimeout.
             const keepalive = setInterval(() => { res.write(': ping\n\n') }, 15000)
 
+            let killProc = null
+            res.on('close', () => { clearInterval(keepalive); if (killProc) killProc() })
+
             runClaudeStream(
                 prompt, systemPrompt, modelParsed.family, tenantSlug, agentSlug,
                 (text) => {
@@ -551,7 +558,9 @@ ${tenantRows}
                     res.write(`data: ${JSON.stringify(doneChunk)}\n\n`)
                     res.write('data: [DONE]\n\n')
                     res.end()
-                }
+                },
+                0,
+                (fn) => { killProc = fn }
             )
         } else {
             runClaude(prompt, systemPrompt, modelParsed.family, tenantSlug, agentSlug, (text, err, usage) => {
