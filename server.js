@@ -20,7 +20,8 @@ const FAMILY_MAP = {
     'saqi-fast': 'claude-haiku-4-5',
 }
 
-const CREDS_FILE = `${HOME}/.claude/.credentials.json`
+const CREDS_FILE    = `${HOME}/.claude/.credentials.json`
+const SETTINGS_FILE = `${HOME}/.claude/settings.json`
 
 function readCreds() {
     try {
@@ -129,12 +130,24 @@ function isRateLimit(text) {
     return RATE_LIMIT_RE.test(text)
 }
 
-function buildClaudeEnv() {
-    const env = { ...process.env, HOME }
-    const c = readCreds()
-    if (typeof c?.apiKey === 'string') {
-        env.ANTHROPIC_API_KEY = c.apiKey
+function buildClaudeEnv(workspacePath = HOME) {
+    const agentClaudeDir = `${workspacePath}/.claude`
+    try {
+        fs.mkdirSync(agentClaudeDir, { recursive: true, mode: 0o700 })
+        const credsLink = `${agentClaudeDir}/.credentials.json`
+        if (!fs.existsSync(credsLink)) {
+            fs.symlinkSync(CREDS_FILE, credsLink)
+        }
+        const settingsDest = `${agentClaudeDir}/settings.json`
+        if (!fs.existsSync(settingsDest)) {
+            fs.copyFileSync(SETTINGS_FILE, settingsDest)
+        }
+    } catch (e) {
+        console.warn(`[env] claude dir setup failed for ${workspacePath}: ${e.message}`)
     }
+    const env = { ...process.env, HOME: workspacePath }
+    const c = readCreds()
+    if (typeof c?.apiKey === 'string') env.ANTHROPIC_API_KEY = c.apiKey
     return env
 }
 
@@ -163,17 +176,18 @@ const RETRY_DELAYS = [5000, 15000, 30000]
 // Non-streaming: collect all output then callback(text, err, usage)
 function runClaude(prompt, systemPrompt, modelFamily, tenantSlug, agentSlug, onDone, attempt = 0) {
     const claudeModel = FAMILY_MAP[modelFamily]
-    const args = ["--print", prompt, "--output-format", "json", "--no-session-persistence", "--dangerously-skip-permissions"]
+    const workspacePath = `${WORKSPACES_BASE}/${tenantSlug}/workspace-${agentSlug}`
+    const args = ["--print", prompt, "--output-format", "json", "--no-session-persistence",
+                  "--permission-mode", "acceptEdits",
+                  "--add-dir", workspacePath]
     if (claudeModel) args.push('--model', claudeModel)
     if (systemPrompt) args.push('--system-prompt', systemPrompt)
-
-    const workspacePath = `${WORKSPACES_BASE}/${tenantSlug}/workspace-${agentSlug}`
     if (!fs.existsSync(workspacePath)) {
         return void onDone(null, `workspace not found: ${tenantSlug}/${agentSlug}`, null)
     }
 
     const proc = spawn(CLAUDE_BIN, args, {
-        env: buildClaudeEnv(),
+        env: buildClaudeEnv(workspacePath),
         cwd: workspacePath,
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: 900000
@@ -241,18 +255,19 @@ function runClaude(prompt, systemPrompt, modelFamily, tenantSlug, agentSlug, onD
 // consumed internally and never reach the caller.
 function runClaudeStream(prompt, systemPrompt, modelFamily, tenantSlug, agentSlug, onChunk, onDone, attempt = 0, onAbort = null) {
     const claudeModel = FAMILY_MAP[modelFamily]
+    const workspacePath = `${WORKSPACES_BASE}/${tenantSlug}/workspace-${agentSlug}`
     const args = ["--print", prompt, "--output-format", "stream-json", "--verbose",
-                  "--no-session-persistence", "--dangerously-skip-permissions"]
+                  "--no-session-persistence",
+                  "--permission-mode", "acceptEdits",
+                  "--add-dir", workspacePath]
     if (claudeModel) args.push('--model', claudeModel)
     if (systemPrompt) args.push('--system-prompt', systemPrompt)
-
-    const workspacePath = `${WORKSPACES_BASE}/${tenantSlug}/workspace-${agentSlug}`
     if (!fs.existsSync(workspacePath)) {
         return void onDone(`workspace not found: ${tenantSlug}/${agentSlug}`, null)
     }
 
     const proc = spawn(CLAUDE_BIN, args, {
-        env: buildClaudeEnv(),
+        env: buildClaudeEnv(workspacePath),
         cwd: workspacePath,
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: 900000
